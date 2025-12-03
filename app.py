@@ -290,6 +290,11 @@ with col1:
                 df["viral_score"] = df.apply(lambda r: compute_viral_score(r["views"], r["subscribers"]), axis=1)
                 df = df.sort_values("viral_score", ascending=False)
 
+                            if results:
+                df = pd.DataFrame(results)
+                df["viral_score"] = df.apply(lambda r: compute_viral_score(r["views"], r["subscribers"]), axis=1)
+                df = df.sort_values("viral_score", ascending=False)
+
                 for _, row in df.iterrows():
                     c1, c2 = st.columns([1, 3])
 
@@ -303,10 +308,11 @@ with col1:
                         st.write(f"Views: **{row['views']}**, Subs: **{row['subscribers']}**, Score: **{row['viral_score']:.2f}**")
                         st.write(short_text(row["description"]))
 
-                       if st.button(f"Save {row['video_id']}", key=f"save_{row['video_id']}"):
-                        upsert_video(conn, row.to_dict())
-                        st.success("Saved!")
-                        st.experimental_rerun()
+                        if st.button(f"Save {row['video_id']}", key=f"save_{row['video_id']}"):
+                            upsert_video(conn, row.to_dict())
+                            st.success("Saved!")
+                            st.experimental_rerun()
+
 
 
 with col2:
