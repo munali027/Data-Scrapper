@@ -2,7 +2,6 @@ import asyncio
 import aiohttp
 import sqlite3
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
 import pandas as pd
 
 import streamlit as st
@@ -20,7 +19,7 @@ YOUTUBE_CHANNEL_URL = "https://www.googleapis.com/youtube/v3/channels"
 
 
 # ----------------------------------------------------------
-# DB SETUP
+# DATABASE
 # ----------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILENAME, check_same_thread=False)
@@ -42,7 +41,7 @@ def init_db():
     return conn
 
 
-def upsert_video(conn: sqlite3.Connection, record: Dict[str, Any]):
+def upsert_video(conn, record):
     cur = conn.cursor()
     cur.execute("""
     INSERT INTO videos (video_id, keyword, title, description, thumbnail, views, subscribers, published_at, last_seen)
@@ -71,11 +70,11 @@ def upsert_video(conn: sqlite3.Connection, record: Dict[str, Any]):
     conn.commit()
 
 
-def fetch_all_saved(conn: sqlite3.Connection) -> pd.DataFrame:
+def fetch_all_saved(conn):
     cur = conn.cursor()
     cur.execute("""
-        SELECT video_id, keyword, title, description, thumbnail, 
-               views, subscribers, published_at, last_seen 
+        SELECT video_id, keyword, title, description, thumbnail,
+               views, subscribers, published_at, last_seen
         FROM videos
     """)
     rows = cur.fetchall()
@@ -87,30 +86,30 @@ def fetch_all_saved(conn: sqlite3.Connection) -> pd.DataFrame:
 # ----------------------------------------------------------
 # HELPERS
 # ----------------------------------------------------------
-def short_text(text: str, limit: int = 200) -> str:
+def short_text(text, limit=200):
     if not text:
         return ""
     return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
-def compute_viral_score(views: int, subscribers: int) -> float:
+def compute_viral_score(views, subscribers):
     return views / (subscribers + 1)
 
 
-def iso_now_minus_days(days: int) -> str:
+def iso_now_minus_days(days):
     return (datetime.utcnow() - timedelta(days=days)).isoformat("T") + "Z"
 
 
 # ----------------------------------------------------------
-# API ASYNC HELPERS
+# ASYNC API FUNCTIONS
 # ----------------------------------------------------------
-async def fetch_json(session, url, params, retries=2):
-    for attempt in range(retries + 1):
+async def fetch_json(session, url, params, retries=3):
+    for attempt in range(retries):
         try:
-            async with session.get(url, params=params, timeout=20) as resp:
+            async with session.get(url, params=params, timeout=15) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                await asyncio.sleep(attempt + 1)
+            await asyncio.sleep(1)
         except:
             await asyncio.sleep(1)
     return {}
@@ -134,8 +133,7 @@ async def fetch_video_stats(session, video_ids):
         return {}
     params = {"part": "statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY}
     data = await fetch_json(session, YOUTUBE_VIDEO_URL, params)
-    out = {item["id"]: item.get("statistics", {}) for item in data.get("items", [])}
-    return out
+    return {item["id"]: item.get("statistics", {}) for item in data.get("items", [])}
 
 
 async def fetch_channel_stats(session, channel_ids):
@@ -143,19 +141,19 @@ async def fetch_channel_stats(session, channel_ids):
         return {}
     params = {"part": "statistics", "id": ",".join(channel_ids), "key": YOUTUBE_API_KEY}
     data = await fetch_json(session, YOUTUBE_CHANNEL_URL, params)
-    out = {item["id"]: item.get("statistics", {}) for item in data.get("items", [])}
-    return out
+    return {item["id"]: item.get("statistics", {}) for item in data.get("items", [])}
 
 
 # ----------------------------------------------------------
-# MAIN PROCESSOR
+# MAIN COLLECTOR
 # ----------------------------------------------------------
 async def process_keywords(keywords, days, max_results_per_kw, min_views, max_subs, progress_cb=None):
+
     published_after = iso_now_minus_days(days)
     connector = aiohttp.TCPConnector(limit=20)
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        # Search tasks
+
         tasks = [search_videos(session, kw, published_after, max_results_per_kw) for kw in keywords]
         responses = await asyncio.gather(*tasks)
 
@@ -171,7 +169,6 @@ async def process_keywords(keywords, days, max_results_per_kw, min_views, max_su
                         "snippet": item["snippet"]
                     })
 
-        # Deduplicate videos
         unique = {v["video_id"]: v for v in videos_flat}
         unique_list = list(unique.values())
 
@@ -179,6 +176,7 @@ async def process_keywords(keywords, days, max_results_per_kw, min_views, max_su
         batch_size = 40
 
         for start in range(0, len(unique_list), batch_size):
+
             batch = unique_list[start:start + batch_size]
             video_ids = [v["video_id"] for v in batch]
             channel_ids = [v["snippet"]["channelId"] for v in batch]
@@ -221,103 +219,125 @@ st.set_page_config(page_title="YouTube Viral Topics — Dashboard", layout="wide
 conn = init_db()
 
 st.title("YouTube Viral Topics — Premium Dashboard")
-st.caption("Async API search • SQLite history • Viral score • CSV export")
+st.caption("Async API search • Viral Finder • SQLite history • CSV export")
 
+# ----------------------------------------------------------
+# SESSION STATE
+# ----------------------------------------------------------
+if "results" not in st.session_state:
+    st.session_state["results"] = []
+
+# ----------------------------------------------------------
 # SIDEBAR
+# ----------------------------------------------------------
 with st.sidebar:
-    st.header("Search Settings")
+    st.header("Search Filters")
+
     days = st.slider("Days to search", 1, 30, 5)
     max_results = st.number_input("Max results per keyword", 1, 50, 5)
-    min_views = st.number_input("Min Views", 0, 1000000, 100)
-    max_subs = st.number_input("Max Subscribers", 0, 10000000, 3000)
+    min_views = st.number_input("Minimum Views", 0, 5000000, 100)
+    max_subs = st.number_input("Maximum Channel Subscribers", 0, 10000000, 3000)
 
     keywords_text = st.text_area("Keywords", value="Reddit Cheating\nAITA\nAffair Story")
     keywords = [k.strip() for k in keywords_text.split("\n") if k.strip()]
 
     st.write("---")
 
-    if st.button("Download Saved as CSV"):
+    if st.button("Download Saved CSV"):
         df_all = fetch_all_saved(conn)
-        st.download_button("Download File", df_all.to_csv(index=False), "saved_data.csv")
+        st.download_button("Download", df_all.to_csv(index=False), "saved_videos.csv")
 
     if st.button("Clear Database"):
-        c = conn.cursor()
-        c.execute("DELETE FROM videos")
+        cur = conn.cursor()
+        cur.execute("DELETE FROM videos")
         conn.commit()
         st.success("Database cleared")
 
 
-# MAIN UI
+# ----------------------------------------------------------
+# MAIN AREA
+# ----------------------------------------------------------
 col1, col2 = st.columns([2, 1])
 
+# LEFT SIDE
 with col1:
     st.subheader("Live Search")
 
     if st.button("Fetch Data (Async)"):
+
         progress = st.progress(0)
         text = st.empty()
 
         def update_progress(done, total):
-            pct = int((done / total) * 100)
+            pct = int(done / total * 100)
             progress.progress(pct)
             text.text(f"Processed {done}/{total}")
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+
         results = loop.run_until_complete(
             process_keywords(
-                keywords, days, max_results, min_views, max_subs,
+                keywords, days, max_results,
+                min_views, max_subs,
                 progress_cb=update_progress
             )
         )
 
+        st.session_state["results"] = results
+
         st.success(f"Found {len(results)} videos")
 
-        if results:
-            df = pd.DataFrame(results)
-            df["viral_score"] = df.apply(lambda r:
-                                         compute_viral_score(r["views"], r["subscribers"]),
-                                         axis=1)
-            df = df.sort_values("viral_score", ascending=False)
+    # --------------------------------------
+    # DISPLAY RESULTS (persisted by session_state)
+    # --------------------------------------
+    if st.session_state["results"]:
 
-            for _, row in df.iterrows():
-                c1, c2 = st.columns([1, 3])
+        df = pd.DataFrame(st.session_state["results"])
+        df["viral_score"] = df.apply(lambda r:
+                                     compute_viral_score(r["views"], r["subscribers"]), axis=1)
+        df = df.sort_values("viral_score", ascending=False)
 
-                with c1:
-                    if row["thumbnail"]:
-                        st.image(row["thumbnail"], width=150)
+        for _, row in df.iterrows():
+            c1, c2 = st.columns([1, 3])
 
-                with c2:
-                    st.markdown(f"### {row['title']}")
-                    st.write(f"Keyword: `{row['keyword']}`")
-                    st.write(f"Views: **{row['views']}**, Subs: **{row['subscribers']}**, Score: **{row['viral_score']:.2f}**")
-                    st.write(short_text(row["description"]))
+            with c1:
+                if row["thumbnail"]:
+                    st.image(row["thumbnail"], width=150)
 
-                    if st.button(f"Save {row['video_id']}", key=f"save_{row['video_id']}"):
-                        upsert_video(conn, row.to_dict())
-                        st.success("Saved!")
-                        st.experimental_rerun()
+            with c2:
+                st.markdown(f"### {row['title']}")
+                st.write(f"Keyword: `{row['keyword']}`")
+                st.write(f"Views: **{row['views']}**, Subs: **{row['subscribers']}**")
+                st.write(f"Viral Score: **{row['viral_score']:.2f}**")
+                st.write(short_text(row["description"]))
+
+                if st.button(f"Save {row['video_id']}", key=f"save_{row['video_id']}"):
+                    upsert_video(conn, row.to_dict())
+                    st.success("Saved!")
 
 
-# HISTORY DASHBOARD
+# ----------------------------------------------------------
+# RIGHT SIDE — HISTORY
+# ----------------------------------------------------------
 with col2:
-    st.subheader("History Dashboard (Saved Data)")
-    df_saved = fetch_all_saved(conn)
+    st.subheader("Saved Videos Dashboard")
 
+    df_saved = fetch_all_saved(conn)
     st.write(f"Total saved videos: {len(df_saved)}")
 
     if len(df_saved):
+
         df_saved["viral_score"] = df_saved.apply(
             lambda r: compute_viral_score(int(r["views"]), int(r["subscribers"])),
             axis=1
         )
 
         st.markdown("**Top Keywords**")
-        exp = df_saved.assign(kw=df_saved["keyword"].split(",") if "," in df_saved["keyword"] else df_saved["keyword"])
         exp = df_saved.assign(kw=df_saved["keyword"].str.split(",")).explode("kw")
         st.table(exp["kw"].value_counts().head(10))
 
-        st.markdown("**Top 10 Viral Score**")
+        st.markdown("**Top Viral Videos**")
         top = df_saved.sort_values("viral_score", ascending=False).head(10)
 
         fig = plt.figure(figsize=(5, 3))
