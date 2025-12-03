@@ -76,11 +76,32 @@ def fetch_all_saved(conn):
         SELECT video_id, keyword, title, description, thumbnail,
                views, subscribers, published_at, last_seen
         FROM videos
+        ORDER BY last_seen DESC
     """)
     rows = cur.fetchall()
     cols = ["video_id", "keyword", "title", "description", "thumbnail",
             "views", "subscribers", "published_at", "last_seen"]
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+def delete_video(conn, video_id):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM videos WHERE video_id=?", (video_id,))
+    conn.commit()
+
+
+def remove_keyword_from_video(conn, video_id, keyword_to_remove):
+    cur = conn.cursor()
+    cur.execute("SELECT keyword FROM videos WHERE video_id=?", (video_id,))
+    row = cur.fetchone()
+    if not row:
+        return
+    current = row[0] or ""
+    keywords = [k.strip() for k in current.split(",") if k.strip()]
+    keywords = [k for k in keywords if k != keyword_to_remove]
+    updated = ",".join(keywords)
+    cur.execute("UPDATE videos SET keyword=? WHERE video_id=?", (updated, video_id))
+    conn.commit()
 
 
 # ----------------------------------------------------------
@@ -93,7 +114,10 @@ def short_text(text, limit=200):
 
 
 def compute_viral_score(views, subscribers):
-    return views / (subscribers + 1)
+    try:
+        return views / (subscribers + 1)
+    except Exception:
+        return float(views)
 
 
 def iso_now_minus_days(days):
@@ -101,7 +125,7 @@ def iso_now_minus_days(days):
 
 
 # ----------------------------------------------------------
-# ASYNC API FUNCTIONS
+# ASYNC API FUNCTIONS (supporting regionCode)
 # ----------------------------------------------------------
 async def fetch_json(session, url, params, retries=3):
     for attempt in range(retries):
@@ -115,7 +139,7 @@ async def fetch_json(session, url, params, retries=3):
     return {}
 
 
-async def search_videos(session, keyword, published_after, max_results):
+async def search_videos(session, keyword, published_after, max_results, region_code=None):
     params = {
         "part": "snippet",
         "q": keyword,
@@ -125,6 +149,8 @@ async def search_videos(session, keyword, published_after, max_results):
         "maxResults": max_results,
         "key": YOUTUBE_API_KEY
     }
+    if region_code:
+        params["regionCode"] = region_code
     return await fetch_json(session, YOUTUBE_SEARCH_URL, params)
 
 
@@ -133,7 +159,10 @@ async def fetch_video_stats(session, video_ids):
         return {}
     params = {"part": "statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY}
     data = await fetch_json(session, YOUTUBE_VIDEO_URL, params)
-    return {item["id"]: item.get("statistics", {}) for item in data.get("items", [])}
+    out = {}
+    for item in data.get("items", []):
+        out[item.get("id")] = item.get("statistics", {})
+    return out
 
 
 async def fetch_channel_stats(session, channel_ids):
@@ -141,20 +170,21 @@ async def fetch_channel_stats(session, channel_ids):
         return {}
     params = {"part": "statistics", "id": ",".join(channel_ids), "key": YOUTUBE_API_KEY}
     data = await fetch_json(session, YOUTUBE_CHANNEL_URL, params)
-    return {item["id"]: item.get("statistics", {}) for item in data.get("items", [])}
+    out = {}
+    for item in data.get("items", []):
+        out[item.get("id")] = item.get("statistics", {})
+    return out
 
 
 # ----------------------------------------------------------
 # MAIN COLLECTOR
 # ----------------------------------------------------------
-async def process_keywords(keywords, days, max_results_per_kw, min_views, max_subs, progress_cb=None):
-
+async def process_keywords(keywords, days, max_results_per_kw, min_views, max_subs, region_code=None, progress_cb=None):
     published_after = iso_now_minus_days(days)
     connector = aiohttp.TCPConnector(limit=20)
 
     async with aiohttp.ClientSession(connector=connector) as session:
-
-        tasks = [search_videos(session, kw, published_after, max_results_per_kw) for kw in keywords]
+        tasks = [search_videos(session, kw, published_after, max_results_per_kw, region_code) for kw in keywords]
         responses = await asyncio.gather(*tasks)
 
         videos_flat = []
@@ -169,6 +199,7 @@ async def process_keywords(keywords, days, max_results_per_kw, min_views, max_su
                         "snippet": item["snippet"]
                     })
 
+        # Deduplicate
         unique = {v["video_id"]: v for v in videos_flat}
         unique_list = list(unique.values())
 
@@ -176,7 +207,6 @@ async def process_keywords(keywords, days, max_results_per_kw, min_views, max_su
         batch_size = 40
 
         for start in range(0, len(unique_list), batch_size):
-
             batch = unique_list[start:start + batch_size]
             video_ids = [v["video_id"] for v in batch]
             channel_ids = [v["snippet"]["channelId"] for v in batch]
@@ -188,8 +218,14 @@ async def process_keywords(keywords, days, max_results_per_kw, min_views, max_su
                 vid = v["video_id"]
                 snip = v["snippet"]
 
-                views = int(video_stats.get(vid, {}).get("viewCount", 0))
-                subs = int(channel_stats.get(snip["channelId"], {}).get("subscriberCount", 0))
+                try:
+                    views = int(video_stats.get(vid, {}).get("viewCount", 0) or 0)
+                except:
+                    views = 0
+                try:
+                    subs = int(channel_stats.get(snip["channelId"], {}).get("subscriberCount", 0) or 0)
+                except:
+                    subs = 0
 
                 rec = {
                     "video_id": vid,
@@ -207,7 +243,7 @@ async def process_keywords(keywords, days, max_results_per_kw, min_views, max_su
                     results.append(rec)
 
             if progress_cb:
-                progress_cb(start + len(batch), len(unique_list))
+                progress_cb(min(start + len(batch), len(unique_list)), len(unique_list))
 
         return results
 
@@ -221,15 +257,13 @@ conn = init_db()
 st.title("YouTube Viral Topics — Premium Dashboard")
 st.caption("Async API search • Viral Finder • SQLite history • CSV export")
 
-# ----------------------------------------------------------
-# SESSION STATE
-# ----------------------------------------------------------
+# session_state for persistence
 if "results" not in st.session_state:
     st.session_state["results"] = []
+if "last_fetch_meta" not in st.session_state:
+    st.session_state["last_fetch_meta"] = {"count": 0, "country": None, "keywords": []}
 
-# ----------------------------------------------------------
-# SIDEBAR
-# ----------------------------------------------------------
+# SIDEBAR: Filters + Country selector
 with st.sidebar:
     st.header("Search Filters")
 
@@ -238,7 +272,14 @@ with st.sidebar:
     min_views = st.number_input("Minimum Views", 0, 5000000, 100)
     max_subs = st.number_input("Maximum Channel Subscribers", 0, 10000000, 3000)
 
-    keywords_text = st.text_area("Keywords", value="Reddit Cheating\nAITA\nAffair Story")
+    # Country selector (YouTube region codes)
+    country = st.selectbox(
+        "Select Country (regionCode)",
+        ["", "US", "GB", "IN", "PK", "CA", "AU", "AE", "SA", "NG", "BD"],
+        index=0
+    )
+
+    keywords_text = st.text_area("Keywords (one per line)", value="Reddit Cheating\nAITA\nAffair Story")
     keywords = [k.strip() for k in keywords_text.split("\n") if k.strip()]
 
     st.write("---")
@@ -254,72 +295,74 @@ with st.sidebar:
         st.success("Database cleared")
 
 
-# ----------------------------------------------------------
-# MAIN AREA
-# ----------------------------------------------------------
+# MAIN LAYOUT
 col1, col2 = st.columns([2, 1])
 
-# LEFT SIDE
 with col1:
     st.subheader("Live Search")
 
+    # Fetch data button
     if st.button("Fetch Data (Async)"):
+        if not keywords:
+            st.warning("Add at least one keyword.")
+        else:
+            progress = st.progress(0)
+            text = st.empty()
 
-        progress = st.progress(0)
-        text = st.empty()
+            def update_progress(done, total):
+                pct = int(done / total * 100) if total else 0
+                progress.progress(pct)
+                text.text(f"Processed {done}/{total}")
 
-        def update_progress(done, total):
-            pct = int(done / total * 100)
-            progress.progress(pct)
-            text.text(f"Processed {done}/{total}")
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        results = loop.run_until_complete(
-            process_keywords(
-                keywords, days, max_results,
-                min_views, max_subs,
-                progress_cb=update_progress
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            results = loop.run_until_complete(
+                process_keywords(
+                    keywords, days, max_results,
+                    min_views, max_subs,
+                    region_code=country if country else None,
+                    progress_cb=update_progress
+                )
             )
-        )
 
-        st.session_state["results"] = results
+            st.session_state["results"] = results
+            st.session_state["last_fetch_meta"] = {
+                "count": len(results),
+                "country": country,
+                "keywords": keywords
+            }
+            st.success(f"Found {len(results)} videos")
 
-        st.success(f"Found {len(results)} videos")
+    # Show last fetch metadata
+    meta = st.session_state.get("last_fetch_meta", {})
+    if meta.get("count", 0):
+        st.markdown(f"**Last fetch:** {meta.get('count')} results — Country: `{meta.get('country') or 'All'}` — Keywords: `{', '.join(meta.get('keywords', []))}`")
 
-    # --------------------------------------
-    # DISPLAY RESULTS (persisted by session_state)
-    # --------------------------------------
+    # Display results from session_state
     if st.session_state["results"]:
-
         df = pd.DataFrame(st.session_state["results"])
-        df["viral_score"] = df.apply(lambda r:
-                                     compute_viral_score(r["views"], r["subscribers"]), axis=1)
+        df["viral_score"] = df.apply(lambda r: compute_viral_score(int(r["views"]), int(r["subscribers"])), axis=1)
         df = df.sort_values("viral_score", ascending=False)
 
         for _, row in df.iterrows():
             c1, c2 = st.columns([1, 3])
 
             with c1:
-                if row["thumbnail"]:
+                if row.get("thumbnail"):
                     st.image(row["thumbnail"], width=150)
 
             with c2:
-                st.markdown(f"### {row['title']}")
-                st.write(f"Keyword: `{row['keyword']}`")
-                st.write(f"Views: **{row['views']}**, Subs: **{row['subscribers']}**")
-                st.write(f"Viral Score: **{row['viral_score']:.2f}**")
-                st.write(short_text(row["description"]))
+                st.markdown(f"### {row.get('title')}")
+                st.write(f"Keyword: `{row.get('keyword')}`")
+                st.write(f"Views: **{row.get('views')}**, Subs: **{row.get('subscribers')}**, Score: **{row.get('viral_score'):.2f}**")
+                st.write(short_text(row.get("description", "")))
 
-                if st.button(f"Save {row['video_id']}", key=f"save_{row['video_id']}"):
+                # Save button (no rerun)
+                if st.button(f"Save {row.get('video_id')}", key=f"save_{row.get('video_id')}"):
+                    # upsert and show success; session_state retains results so UI doesn't "lose" them
                     upsert_video(conn, row.to_dict())
                     st.success("Saved!")
 
-
-# ----------------------------------------------------------
-# RIGHT SIDE — HISTORY
-# ----------------------------------------------------------
 with col2:
     st.subheader("Saved Videos Dashboard")
 
@@ -327,19 +370,56 @@ with col2:
     st.write(f"Total saved videos: {len(df_saved)}")
 
     if len(df_saved):
-
-        df_saved["viral_score"] = df_saved.apply(
-            lambda r: compute_viral_score(int(r["views"]), int(r["subscribers"])),
-            axis=1
-        )
+        df_saved["viral_score"] = df_saved.apply(lambda r: compute_viral_score(int(r["views"]), int(r["subscribers"])), axis=1)
 
         st.markdown("**Top Keywords**")
         exp = df_saved.assign(kw=df_saved["keyword"].str.split(",")).explode("kw")
         st.table(exp["kw"].value_counts().head(10))
 
+        st.markdown("**Saved Videos List**")
+        # Show each saved video with options to delete or remove keywords
+        for _, row in df_saved.iterrows():
+            vid = row["video_id"]
+            title = row["title"]
+            thumbs = row["thumbnail"]
+            keywords_str = row["keyword"] or ""
+            keywords_list = [k.strip() for k in keywords_str.split(",") if k.strip()]
+
+            with st.expander(f"{title} ({vid})", expanded=False):
+                c1, c2 = st.columns([1, 3])
+                with c1:
+                    if thumbs:
+                        st.image(thumbs, width=120)
+                with c2:
+                    st.write(f"Views: **{row['views']}**, Subs: **{row['subscribers']}**, Score: **{compute_viral_score(int(row['views']), int(row['subscribers'])):.2f}**")
+                    st.write(short_text(row["description"]))
+                    st.write("---")
+                    st.write("**Keywords attached:**")
+                    if keywords_list:
+                        kw_cols = st.columns(len(keywords_list))
+                        for i, kw in enumerate(keywords_list):
+                            with kw_cols[i]:
+                                st.write(f"`{kw}`")
+                                # Remove specific keyword button
+                                if st.button(f"Remove '{kw}' from {vid}", key=f"rem_{vid}_{kw}"):
+                                    remove_keyword_from_video(conn, vid, kw)
+                                    st.success(f"Removed keyword '{kw}'")
+                                    # refresh df_saved after action
+                                    df_saved = fetch_all_saved(conn)
+                                    st.experimental_rerun()
+                    else:
+                        st.write("_No keywords attached_")
+
+                    st.write("---")
+                    # Delete whole video
+                    if st.button(f"Delete video {vid}", key=f"del_{vid}"):
+                        delete_video(conn, vid)
+                        st.success("Video deleted from saved list.")
+                        st.experimental_rerun()
+
+        # Top viral plot
         st.markdown("**Top Viral Videos**")
         top = df_saved.sort_values("viral_score", ascending=False).head(10)
-
         fig = plt.figure(figsize=(5, 3))
         plt.bar(range(len(top)), top["viral_score"])
         plt.xticks(range(len(top)), top["title"].str.slice(0, 20), rotation=45)
