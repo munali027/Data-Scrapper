@@ -14,7 +14,7 @@ from matplotlib import pyplot as plt
 # ----------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------
-YOUTUBE_API_KEY = "AIzaSyBxHc-_agIj6Wf_x3hJdP5cW-3m9UXshJU"   # <-- REQUIRED!
+YOUTUBE_API_KEY = "AIzaSyBxHc-_agIj6Wf_x3hJdP5cW-3m9UXshJU"   # <-- YOUR API KEY INSERTED
 DB_FILENAME = "youtube_data.db"
 
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
@@ -67,7 +67,7 @@ def upsert_video(conn: sqlite3.Connection, record: Dict[str, Any]):
         record["description"],
         record["thumbnail"],
         record["views"],
-        record["subscribers"],     # FIXED NAME
+        record["subscribers"],
         record.get("published_at", ""),
         record["last_seen"]
     ))
@@ -174,7 +174,6 @@ async def process_keywords(keywords, days, max_results_per_kw, min_views, max_su
                         "snippet": item["snippet"]
                     })
 
-        # Unique video IDs
         unique = {}
         for v in videos_flat:
             if v["video_id"] not in unique:
@@ -261,7 +260,7 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.subheader("Live Search")
 
-    if YOUTUBE_API_KEY == "AIzaSyBxHc-_agIj6Wf_x3hJdP5cW-3m9UXshJU":
+    if YOUTUBE_API_KEY == "ENTER_YOUR_API_KEY_HERE":
         st.error("Add your YouTube API key inside app.py first!")
     else:
         run = st.button("Fetch Data (Async)")
