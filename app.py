@@ -303,9 +303,10 @@ with col1:
                         st.write(f"Views: **{row['views']}**, Subs: **{row['subscribers']}**, Score: **{row['viral_score']:.2f}**")
                         st.write(short_text(row["description"]))
 
-                        if st.button(f"Save {row['video_id']}", key=row["video_id"]):
-                            upsert_video(conn, row.to_dict())
-                            st.success("Saved!")
+                       if st.button(f"Save {row['video_id']}", key=f"save_{row['video_id']}"):
+                        upsert_video(conn, row.to_dict())
+                        st.success("Saved!")
+                        st.experimental_rerun()
 
 
 with col2:
