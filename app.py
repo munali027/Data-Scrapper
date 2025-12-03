@@ -1,20 +1,17 @@
 import asyncio
 import aiohttp
 import sqlite3
-import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 import pandas as pd
-import math
 
 import streamlit as st
 from matplotlib import pyplot as plt
 
-
 # ----------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------
-YOUTUBE_API_KEY = "AIzaSyBxHc-_agIj6Wf_x3hJdP5cW-3m9UXshJU"   # <-- YOUR API KEY INSERTED
+YOUTUBE_API_KEY = "AIzaSyBxHc-_agIj6Wf_x3hJdP5cW-3m9UXshJU"
 DB_FILENAME = "youtube_data.db"
 
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
@@ -23,7 +20,7 @@ YOUTUBE_CHANNEL_URL = "https://www.googleapis.com/youtube/v3/channels"
 
 
 # ----------------------------------------------------------
-# DATABASE SETUP
+# DB SETUP
 # ----------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILENAME, check_same_thread=False)
@@ -68,7 +65,7 @@ def upsert_video(conn: sqlite3.Connection, record: Dict[str, Any]):
         record["thumbnail"],
         record["views"],
         record["subscribers"],
-        record.get("published_at", ""),
+        record["published_at"],
         record["last_seen"]
     ))
     conn.commit()
@@ -76,9 +73,14 @@ def upsert_video(conn: sqlite3.Connection, record: Dict[str, Any]):
 
 def fetch_all_saved(conn: sqlite3.Connection) -> pd.DataFrame:
     cur = conn.cursor()
-    cur.execute("SELECT video_id, keyword, title, description, thumbnail, views, subscribers, published_at, last_seen FROM videos")
+    cur.execute("""
+        SELECT video_id, keyword, title, description, thumbnail, 
+               views, subscribers, published_at, last_seen 
+        FROM videos
+    """)
     rows = cur.fetchall()
-    cols = ["video_id","keyword","title","description","thumbnail","views","subscribers","published_at","last_seen"]
+    cols = ["video_id", "keyword", "title", "description", "thumbnail",
+            "views", "subscribers", "published_at", "last_seen"]
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
 
@@ -100,7 +102,7 @@ def iso_now_minus_days(days: int) -> str:
 
 
 # ----------------------------------------------------------
-# ASYNC FETCH FUNCTIONS
+# API ASYNC HELPERS
 # ----------------------------------------------------------
 async def fetch_json(session, url, params, retries=2):
     for attempt in range(retries + 1):
@@ -108,7 +110,7 @@ async def fetch_json(session, url, params, retries=2):
             async with session.get(url, params=params, timeout=20) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                await asyncio.sleep(1 * (attempt + 1))
+                await asyncio.sleep(attempt + 1)
         except:
             await asyncio.sleep(1)
     return {}
@@ -132,9 +134,7 @@ async def fetch_video_stats(session, video_ids):
         return {}
     params = {"part": "statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY}
     data = await fetch_json(session, YOUTUBE_VIDEO_URL, params)
-    out = {}
-    for item in data.get("items", []):
-        out[item["id"]] = item.get("statistics", {})
+    out = {item["id"]: item.get("statistics", {}) for item in data.get("items", [])}
     return out
 
 
@@ -143,29 +143,26 @@ async def fetch_channel_stats(session, channel_ids):
         return {}
     params = {"part": "statistics", "id": ",".join(channel_ids), "key": YOUTUBE_API_KEY}
     data = await fetch_json(session, YOUTUBE_CHANNEL_URL, params)
-    out = {}
-    for item in data.get("items", []):
-        out[item["id"]] = item.get("statistics", {})
+    out = {item["id"]: item.get("statistics", {}) for item in data.get("items", [])}
     return out
 
 
 # ----------------------------------------------------------
-# MAIN ASYNC PROCESSOR
+# MAIN PROCESSOR
 # ----------------------------------------------------------
 async def process_keywords(keywords, days, max_results_per_kw, min_views, max_subs, progress_cb=None):
     published_after = iso_now_minus_days(days)
     connector = aiohttp.TCPConnector(limit=20)
 
     async with aiohttp.ClientSession(connector=connector) as session:
+        # Search tasks
         tasks = [search_videos(session, kw, published_after, max_results_per_kw) for kw in keywords]
         responses = await asyncio.gather(*tasks)
 
-        # Flatten videos
         videos_flat = []
         for i, data in enumerate(responses):
             kw = keywords[i]
-            items = data.get("items", [])
-            for item in items:
+            for item in data.get("items", []):
                 vid = item.get("id", {}).get("videoId")
                 if vid:
                     videos_flat.append({
@@ -174,11 +171,8 @@ async def process_keywords(keywords, days, max_results_per_kw, min_views, max_su
                         "snippet": item["snippet"]
                     })
 
-        unique = {}
-        for v in videos_flat:
-            if v["video_id"] not in unique:
-                unique[v["video_id"]] = v
-
+        # Deduplicate videos
+        unique = {v["video_id"]: v for v in videos_flat}
         unique_list = list(unique.values())
 
         results = []
@@ -229,8 +223,7 @@ conn = init_db()
 st.title("YouTube Viral Topics — Premium Dashboard")
 st.caption("Async API search • SQLite history • Viral score • CSV export")
 
-
-# Sidebar
+# SIDEBAR
 with st.sidebar:
     st.header("Search Settings")
     days = st.slider("Days to search", 1, 30, 5)
@@ -260,61 +253,53 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.subheader("Live Search")
 
-    if YOUTUBE_API_KEY == "ENTER_YOUR_API_KEY_HERE":
-        st.error("Add your YouTube API key inside app.py first!")
-    else:
-        run = st.button("Fetch Data (Async)")
+    if st.button("Fetch Data (Async)"):
+        progress = st.progress(0)
+        text = st.empty()
 
-        if run:
-            progress = st.progress(0)
-            text = st.empty()
+        def update_progress(done, total):
+            pct = int((done / total) * 100)
+            progress.progress(pct)
+            text.text(f"Processed {done}/{total}")
 
-            def update_progress(done, total):
-                pct = int((done / total) * 100)
-                progress.progress(pct)
-                text.text(f"Processed {done}/{total}")
-
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            results = loop.run_until_complete(
-                process_keywords(
-                    keywords, days, max_results, min_views, max_subs,
-                    progress_cb=update_progress
-                )
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        results = loop.run_until_complete(
+            process_keywords(
+                keywords, days, max_results, min_views, max_subs,
+                progress_cb=update_progress
             )
+        )
 
-            st.success(f"Found {len(results)} videos")
+        st.success(f"Found {len(results)} videos")
 
-            if results:
-                df = pd.DataFrame(results)
-                df["viral_score"] = df.apply(lambda r: compute_viral_score(r["views"], r["subscribers"]), axis=1)
-                df = df.sort_values("viral_score", ascending=False)
+        if results:
+            df = pd.DataFrame(results)
+            df["viral_score"] = df.apply(lambda r:
+                                         compute_viral_score(r["views"], r["subscribers"]),
+                                         axis=1)
+            df = df.sort_values("viral_score", ascending=False)
 
-                            if results:
-                df = pd.DataFrame(results)
-                df["viral_score"] = df.apply(lambda r: compute_viral_score(r["views"], r["subscribers"]), axis=1)
-                df = df.sort_values("viral_score", ascending=False)
+            for _, row in df.iterrows():
+                c1, c2 = st.columns([1, 3])
 
-                for _, row in df.iterrows():
-                    c1, c2 = st.columns([1, 3])
+                with c1:
+                    if row["thumbnail"]:
+                        st.image(row["thumbnail"], width=150)
 
-                    with c1:
-                        if row["thumbnail"]:
-                            st.image(row["thumbnail"], width=150)
+                with c2:
+                    st.markdown(f"### {row['title']}")
+                    st.write(f"Keyword: `{row['keyword']}`")
+                    st.write(f"Views: **{row['views']}**, Subs: **{row['subscribers']}**, Score: **{row['viral_score']:.2f}**")
+                    st.write(short_text(row["description"]))
 
-                    with c2:
-                        st.markdown(f"### {row['title']}")
-                        st.write(f"Keyword: `{row['keyword']}`")
-                        st.write(f"Views: **{row['views']}**, Subs: **{row['subscribers']}**, Score: **{row['viral_score']:.2f}**")
-                        st.write(short_text(row["description"]))
-
-                        if st.button(f"Save {row['video_id']}", key=f"save_{row['video_id']}"):
-                            upsert_video(conn, row.to_dict())
-                            st.success("Saved!")
-                            st.experimental_rerun()
+                    if st.button(f"Save {row['video_id']}", key=f"save_{row['video_id']}"):
+                        upsert_video(conn, row.to_dict())
+                        st.success("Saved!")
+                        st.experimental_rerun()
 
 
-
+# HISTORY DASHBOARD
 with col2:
     st.subheader("History Dashboard (Saved Data)")
     df_saved = fetch_all_saved(conn)
@@ -322,9 +307,13 @@ with col2:
     st.write(f"Total saved videos: {len(df_saved)}")
 
     if len(df_saved):
-        df_saved["viral_score"] = df_saved.apply(lambda r: compute_viral_score(int(r["views"]), int(r["subscribers"])), axis=1)
+        df_saved["viral_score"] = df_saved.apply(
+            lambda r: compute_viral_score(int(r["views"]), int(r["subscribers"])),
+            axis=1
+        )
 
         st.markdown("**Top Keywords**")
+        exp = df_saved.assign(kw=df_saved["keyword"].split(",") if "," in df_saved["keyword"] else df_saved["keyword"])
         exp = df_saved.assign(kw=df_saved["keyword"].str.split(",")).explode("kw")
         st.table(exp["kw"].value_counts().head(10))
 
