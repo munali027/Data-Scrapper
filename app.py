@@ -313,7 +313,7 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.subheader("Live Search")
     st.write("API Key in file variable YOUTUBE_API_KEY; make sure it's set.")
-    if YOUTUBE_API_KEY == "ENTER_YOUR_API_KEY_HERE":
+    if YOUTUBE_API_KEY == "AIzaSyBxHc-_agIj6Wf_x3hJdP5cW-3m9UXshJU":
         st.error("You must set your YouTube API key in the script variable YOUTUBE_API_KEY before running searches.")
     days_input = days  # from sidebar
     max_results_input = max_results
@@ -322,7 +322,7 @@ with col1:
 
     run_search = st.button("Fetch Data (Async)")
 
-    if run_search and YOUTUBE_API_KEY != "ENTER_YOUR_API_KEY_HERE":
+    if run_search and YOUTUBE_API_KEY != "AIzaSyBxHc-_agIj6Wf_x3hJdP5cW-3m9UXshJU":
         progress_text = st.empty()
         prog_bar = st.progress(0)
         status_box = st.empty()
